@@ -1,188 +1,427 @@
 
 "use client";
 
-import { useRef, useState } from "react";
-import { Bell, Sparkles, LoaderCircle } from "lucide-react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+
+import { Bell, Sparkles } from "lucide-react";
+
 import Sidebar from "./components/Sidebar";
 import WelcomeScreen from "./components/WelcomeScreen";
 import ChatInput from "./components/ChatInput";
+import MarkdownMessage from "./components/MarkdownMessage";
 
-type Message = {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-};
+import {
+  createChat,
+  deleteChat,
+  generateChatTitle,
+  getChats,
+  saveChats,
+  updateChat,
+} from "./lib/chatStorage";
+
+import type {
+  Chat,
+  Message,
+} from "./lib/chatStorage";
 
 export default function Home() {
-  const [messages, setMessages] = useState<Message[]>([]);
+  // =====================================
+  // STATES
+  // =====================================
+
+  const [chats, setChats] = useState<Chat[]>([]);
+  const [activeChatId, setActiveChatId] =
+    useState<string | null>(null);
+
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [initialized, setInitialized] = useState(false);
 
-  const messagesRef = useRef<Message[]>([]);
+  // =====================================
+  // REFS
+  // =====================================
+
+  const chatsRef = useRef<Chat[]>([]);
+  const activeChatIdRef = useRef<string | null>(null);
+  const requestRef = useRef<AbortController | null>(null);
   const busyRef = useRef(false);
-  const conversationRef = useRef(0);
 
-  const handleSend = async (content: string) => {
-    if (!content.trim() || busyRef.current) return;
+  // =====================================
+  // CHAT STATE HELPERS
+  // =====================================
+
+  const setActiveChat = useCallback(
+    (id: string | null) => {
+      activeChatIdRef.current = id;
+      setActiveChatId(id);
+    },
+    []
+  );
+
+  const persistChats = useCallback(
+    (nextChats: Chat[]) => {
+      chatsRef.current = nextChats;
+      setChats(nextChats);
+      saveChats(nextChats);
+    },
+    []
+  );
+
+  // =====================================
+  // LOAD SAVED CONVERSATIONS
+  // =====================================
+
+  useEffect(() => {
+    const storedChats = getChats();
+
+    chatsRef.current = storedChats;
+
+    queueMicrotask(() => {
+      setChats(storedChats);
+      setInitialized(true);
+    });
+
+    return () => {
+      requestRef.current?.abort();
+    };
+  }, []);
+
+  // =====================================
+  // ACTIVE CONVERSATION
+  // =====================================
+
+  const activeChat =
+    chats.find(
+      (chat) => chat.id === activeChatId
+    ) ?? null;
+
+  const messages = activeChat?.messages ?? [];
+
+  // =====================================
+  // CANCEL ACTIVE REQUEST
+  // =====================================
+
+  function cancelCurrentRequest() {
+    requestRef.current?.abort();
+    requestRef.current = null;
+
+    busyRef.current = false;
+
+    setLoading(false);
+    setError("");
+  }
+
+  // =====================================
+  // NEW CHAT
+  // =====================================
+
+  function handleNewChat() {
+    cancelCurrentRequest();
+    setActiveChat(null);
+  }
+
+  // =====================================
+  // OPEN SAVED CHAT
+  // =====================================
+
+  function handleSelectChat(id: string) {
+    const exists = chatsRef.current.some(
+      (chat) => chat.id === id
+    );
+
+    if (!exists) return;
+
+    cancelCurrentRequest();
+    setActiveChat(id);
+  }
+
+  // =====================================
+  // DELETE SAVED CHAT
+  // =====================================
+
+  function handleDeleteChat(id: string) {
+    const confirmed = window.confirm(
+      "Are you sure you want to delete this conversation?"
+    );
+
+    if (!confirmed) return;
+
+    if (activeChatIdRef.current === id) {
+      cancelCurrentRequest();
+      setActiveChat(null);
+    }
+
+    const remainingChats = deleteChat(
+      chatsRef.current,
+      id
+    );
+
+    persistChats(remainingChats);
+  }
+
+  // =====================================
+  // SEND MESSAGE TO GEMINI
+  // =====================================
+
+  async function handleSend(text: string) {
+    const content = text.trim();
+
+    if (
+      !content ||
+      busyRef.current ||
+      !initialized
+    ) {
+      return;
+    }
 
     busyRef.current = true;
-    const conversationId = conversationRef.current;
-
-    const userMessage: Message = {
-      id: crypto.randomUUID(),
-      role: "user",
-      content: content.trim(),
-    };
-
-    const updatedMessages = [
-      ...messagesRef.current,
-      userMessage,
-    ];
-
-    messagesRef.current = updatedMessages;
-    setMessages(updatedMessages);
     setLoading(true);
     setError("");
 
+    // Find the active chat.
+    let chat = chatsRef.current.find(
+      (item) =>
+        item.id === activeChatIdRef.current
+    );
+
+    // Create a new chat if needed.
+    if (!chat) {
+      chat = createChat();
+      chat.title = generateChatTitle(content);
+
+      setActiveChat(chat.id);
+    }
+
+    const chatId = chat.id;
+
+    // Add the user's message.
+    const userMessage: Message = {
+      role: "user",
+      content,
+    };
+
+    const updatedChat: Chat = {
+      ...chat,
+      messages: [
+        ...chat.messages,
+        userMessage,
+      ],
+      updatedAt: new Date().toISOString(),
+    };
+
+    // Save immediately.
+    persistChats(
+      updateChat(
+        chatsRef.current,
+        updatedChat
+      )
+    );
+
+    const controller = new AbortController();
+    requestRef.current = controller;
+
     try {
+      // Call your existing Gemini API route.
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          messages: updatedMessages
-            .filter((message) => !message.content.startsWith(
-              "Sorry, I couldn't generate a response."
-            ))
-            .slice(-30)
-            .map(({ role, content }) => ({
-              role,
-              content,
-            })),
+          messages: updatedChat.messages,
         }),
+        signal: controller.signal,
       });
 
-      const data = await response.json();
+      const data: {
+        reply?: string;
+        error?: string;
+      } = await response.json();
 
       if (!response.ok) {
-        throw new Error(data.error || "Request failed");
+        throw new Error(
+          data.error ||
+            "Unable to generate a response."
+        );
       }
 
-      if (conversationId !== conversationRef.current) return;
+      if (!data.reply?.trim()) {
+        throw new Error(
+          "Gemini returned an empty response."
+        );
+      }
 
+      // Ignore responses from canceled requests.
+      if (
+        controller.signal.aborted ||
+        activeChatIdRef.current !== chatId
+      ) {
+        return;
+      }
+
+      const latestChat =
+        chatsRef.current.find(
+          (item) => item.id === chatId
+        );
+
+      if (!latestChat) return;
+
+      // Add Gemini's response.
       const assistantMessage: Message = {
-        id: crypto.randomUUID(),
         role: "assistant",
-        content: data.reply,
+        content: data.reply.trim(),
       };
 
-      messagesRef.current = [
-        ...messagesRef.current,
-        assistantMessage,
-      ];
-      setMessages(messagesRef.current);
-    } catch (err) {
-      if (conversationId !== conversationRef.current) return;
+      const completedChat: Chat = {
+        ...latestChat,
+        messages: [
+          ...latestChat.messages,
+          assistantMessage,
+        ],
+        updatedAt: new Date().toISOString(),
+      };
 
-      console.error("Chat error:", err);
+      // Save the completed conversation.
+      persistChats(
+        updateChat(
+          chatsRef.current,
+          completedChat
+        )
+      );
+    } catch (err: unknown) {
+      if (controller.signal.aborted) {
+        return;
+      }
 
-      setError(
+      const message =
         err instanceof Error
           ? err.message
-          : "Something went wrong. Please try again."
-      );
+          : "Something went wrong.";
+
+      setError(message);
+      console.error("Chat error:", err);
     } finally {
-      if (conversationId === conversationRef.current) {
-        setLoading(false);
+      if (requestRef.current === controller) {
+        requestRef.current = null;
         busyRef.current = false;
+        setLoading(false);
       }
     }
-  };
+  }
 
-  const handleNewChat = () => {
-    conversationRef.current += 1;
-    busyRef.current = false;
-    messagesRef.current = [];
-    setMessages([]);
-    setError("");
-    setLoading(false);
-  };
+  // =====================================
+  // USER INTERFACE
+  // =====================================
 
   return (
-    <div className="app-layout">
-      <Sidebar onNewChat={handleNewChat} />
+    <div className="app-shell">
+      {/* GREEN SIDEBAR */}
+      <Sidebar
+        chats={chats}
+        activeChatId={activeChatId}
+        onNewChat={handleNewChat}
+        onSelectChat={handleSelectChat}
+        onDeleteChat={handleDeleteChat}
+      />
 
+      {/* MAIN DASHBOARD */}
       <main className="main-content">
-        <header className="topbar">
-          <div className="topbar-title">
-            <Sparkles size={19} />
-            <span>AI Workspace</span>
-          </div>
+        <div className="chat-page">
 
-          <div className="topbar-actions">
-            <button
-              className="notification-btn"
-              title="Notifications coming soon"
-              disabled
-              aria-label="Notifications coming soon"
-            >
-              <Bell size={20} />
-            </button>
-            <div className="user-avatar">U</div>
-          </div>
-        </header>
+          {/* AI WORKSPACE HEADER */}
+          <header className="topbar">
+            <div className="topbar-title">
+              <Sparkles size={21} />
+              <span>AI Workspace</span>
+            </div>
 
-        <div className="content-area">
-          {messages.length === 0 ? (
-            <WelcomeScreen onPrompt={handleSend} />
+            <div className="topbar-actions">
+              <Bell
+                size={20}
+                className="notification-btn"
+              />
+
+              <div className="user-avatar">
+                U
+              </div>
+            </div>
+          </header>
+
+          {/* WELCOME SCREEN OR CHAT */}
+          {!initialized ? (
+            <div className="content-area">
+              <div className="chat-loading">
+                Loading conversations...
+              </div>
+            </div>
+          ) : messages.length === 0 ? (
+            <div className="content-area">
+              <WelcomeScreen
+                onPrompt={handleSend}
+              />
+            </div>
           ) : (
-            <div className="messages-container">
-              {messages.map((message) => (
-                <div
-                  key={message.id}
-                  className={`message ${message.role}`}
-                >
-                  {message.role === "assistant" && (
-                    <div className="assistant-avatar">
-                      <Sparkles size={18} />
+            <div className="chat-messages">
+              {messages.map(
+                (message, index) => (
+                  <div
+                    key={`${activeChatId}-${index}`}
+                    className={`message ${
+                      message.role === "user"
+                        ? "user-message"
+                        : "assistant-message"
+                    }`}
+                  >
+                    <div className="message-avatar">
+                      {message.role === "user"
+                        ? "You"
+                        : "AI"}
                     </div>
-                  )}
 
-                  <div className="message-bubble">
-                    {message.content}
+                    <div className="message-content">
+  {message.role === "assistant" ? (
+    <MarkdownMessage content={message.content} />
+  ) : (
+    message.content
+  )}
+</div>
                   </div>
-                </div>
-              ))}
-
-              {loading && (
-                <div className="message assistant">
-                  <div className="assistant-avatar">
-                    <Sparkles size={18} />
-                  </div>
-                  <div className="message-bubble typing-indicator">
-                    <LoaderCircle
-                      size={19}
-                      className="loading-spinner"
-                    />
-                    IntelliChat is thinking...
-                  </div>
-                </div>
+                )
               )}
 
-              {error && (
-                <div className="chat-error" role="alert">
-                  {error}
+              {/* AI THINKING INDICATOR */}
+              {loading && (
+                <div className="typing-indicator">
+                  <span className="loading-spinner" />
+                  IntelliChat is thinking...
                 </div>
               )}
             </div>
           )}
-        </div>
 
-        <ChatInput
-          onSend={handleSend}
-          disabled={loading}
-        />
+          {/* ERROR MESSAGE */}
+          {error && (
+            <div
+              className="chat-error"
+              role="alert"
+            >
+              {error}
+            </div>
+          )}
+
+          {/* FIXED BOTTOM CHAT INPUT */}
+          <ChatInput
+            onSend={handleSend}
+            disabled={
+              loading || !initialized
+            }
+          />
+        </div>
       </main>
     </div>
   );
